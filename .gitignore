@@ -468,5 +468,3 @@ yarn-error.log*
 
 # Lark OAuth tokens (sensitive)
 .lark_tokens.json
-
-docs/ai_summarize
