@@ -11,6 +11,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ========= Copyright 2023-2026 @ CAMEL-AI.org. All Rights Reserved. =========
+
+# =============================================================================
+# CAMEL Workforce - Multi-Agent Collaboration System
+# =============================================================================
+# This file implements the Workforce class, which orchestrates multiple AI agents
+# to collaborate on complex tasks through planning, assignment, and execution.
+#
+# Core Architecture:
+#   1. Task Planner Agent: Decomposes complex tasks into manageable subtasks
+#   2. Coordinator Agent: Assigns tasks to workers based on capabilities
+#   3. Worker Nodes: Execute assigned tasks (SingleAgentWorker, RolePlayingWorker)
+#
+# Main Execution Flow:
+#   process_task_async() → handle_decompose_append_task() → _decompose_task()
+#       ↓
+#   start() → _listen_to_channel() [Main Event Loop]
+#       ↓
+#   _post_ready_tasks() → _find_assignee() → _post_task()
+#       ↓
+#   Worker executes → _get_returned_task() → Result handling
+#
+# Key Features:
+#   - Task decomposition with dependency management
+#   - Failure recovery with multiple strategies (retry, replan, reassign, etc.)
+#   - Support for both AUTO_DECOMPOSE and PIPELINE execution modes
+#   - Human intervention support (pause/resume/snapshot)
+#   - Streaming output support
+# =============================================================================
+
 from __future__ import annotations
 
 import asyncio
@@ -122,15 +151,31 @@ if os.environ.get("TRACEROOT_ENABLED", "False").lower() == "true":
 else:
     logger = get_logger(__name__)
 
-# Constants for configuration values
-MAX_TASK_RETRIES = 3
-MAX_PENDING_TASKS_LIMIT = 20
-TASK_TIMEOUT_SECONDS = 600.0
-DEFAULT_WORKER_POOL_SIZE = 10
+# =============================================================================
+# Configuration Constants
+# =============================================================================
+MAX_TASK_RETRIES = 3              # Maximum retry attempts for failed tasks
+MAX_PENDING_TASKS_LIMIT = 20      # Maximum number of pending tasks in queue
+TASK_TIMEOUT_SECONDS = 600.0      # Task execution timeout (10 minutes)
+DEFAULT_WORKER_POOL_SIZE = 10     # Default agent pool size per worker
 
+
+# =============================================================================
+# Workforce State Management
+# =============================================================================
 
 class WorkforceState(Enum):
-    r"""Workforce execution state for human intervention support."""
+    r"""Workforce execution state for human intervention support.
+
+    These states control the lifecycle of the workforce, enabling pause/resume/stop
+    operations for debugging and monitoring.
+
+    States:
+        IDLE: Workforce initialized but not yet started
+        RUNNING: Actively processing tasks
+        PAUSED: Execution suspended, can be resumed
+        STOPPED: Execution terminated
+    """
 
     IDLE = "idle"
     RUNNING = "running"
@@ -139,14 +184,43 @@ class WorkforceState(Enum):
 
 
 class WorkforceMode(Enum):
-    r"""Workforce execution mode for different task processing strategies."""
+    r"""Workforce execution mode for different task processing strategies.
+
+    AUTO_DECOMPOSE (default):
+        - Tasks are dynamically decomposed into subtasks by Task Agent
+        - Supports intelligent failure recovery (replan, reassign, create_worker)
+        - Dependencies must succeed before dependent tasks run
+        - Best for complex, exploratory tasks
+
+    PIPELINE:
+        - Uses predefined task sequences (set via set_pipeline_tasks)
+        - Simple retry logic only
+        - Failed dependencies don't block downstream tasks
+        - Best for fixed workflows with known steps
+    """
 
     AUTO_DECOMPOSE = "auto_decompose"  # Automatic task decomposition mode
     PIPELINE = "pipeline"  # Predefined pipeline mode
 
 
 class WorkforceSnapshot:
-    r"""Snapshot of workforce state for resuming execution."""
+    r"""Snapshot of workforce state for resuming execution.
+
+    Captures the complete state of a workforce at a point in time, enabling:
+    - Pause and resume operations for human intervention
+    - Recovery from failures
+    - Inspection of execution progress
+
+    Attributes:
+        main_task: The primary task being processed
+        pending_tasks: Queue of tasks waiting to be assigned/executed
+        completed_tasks: List of finished tasks
+        task_dependencies: Dependency graph (task_id -> list of dependency task_ids)
+        assignees: Mapping of task_id -> worker_id
+        current_task_index: Index for tracking pipeline progress
+        description: Human-readable description of the snapshot
+        timestamp: When the snapshot was created (auto-set)
+    """
 
     def __init__(
         self,
@@ -173,16 +247,82 @@ class WorkforceSnapshot:
 
 
 class Workforce(BaseNode):
-    r"""A system where multiple worker nodes (agents) cooperate together
-    to solve tasks. It can assign tasks to worker nodes and also take
-    strategies such as create new worker, decompose tasks, etc. to handle
-    situations when the task fails.
+    r"""多智能体协作系统 - 协调多个Worker共同完成复杂任务。
 
-    The workforce uses three specialized ChatAgents internally:
-    - Coordinator Agent: Assigns tasks to workers based on their
-      capabilities
-    - Task Planner Agent: Decomposes complex tasks and composes results
-    - Dynamic Workers: Created at runtime when tasks fail repeatedly
+    架构概述:
+    --------
+    Workforce协调三个专门的Agent协同工作:
+
+    1. 任务规划Agent (self.task_agent):
+       - 使用TASK_DECOMPOSE_PROMPT将复杂任务分解为子任务
+       - 分析任务失败原因并推荐恢复策略
+       - 评估任务质量,决定是否需要重新执行
+       - 参见: _decompose_task(), _analyze_task()
+
+    2. 协调Agent (self.coordinator_agent):
+       - 根据Worker能力分配任务
+       - 使用ASSIGN_TASK_PROMPT确定最佳任务-Worker匹配
+       - 动态创建新Worker
+       - 参见: _find_assignee(), _call_coordinator_for_assignment()
+
+    3. Worker节点 (self._children):
+       - SingleAgentWorker: 单个Agent,支持代理池
+       - RolePlayingWorker: 双Agent角色扮演场景
+       - 嵌套Workforce: 子Workforce用于分层任务管理
+       - 参见: _post_task(), Worker._process_task()
+
+    主执行流程:
+    ----------
+    1. 入口: process_task_async(task)
+       - 验证任务内容
+       - AUTO_DECOMPOSE模式: 调用handle_decompose_append_task()
+
+    2. 任务分解: handle_decompose_append_task(task)
+       - 验证并重置Workforce状态
+       - 调用_decompose_task()分解复杂任务
+       - 将子任务添加到_pending_tasks队列
+
+    3. 执行启动: start()
+       - 如启用则同步共享内存
+       - 启动所有子Worker
+       - 进入主事件循环: _listen_to_channel()
+
+    4. 主事件循环: _listen_to_channel()
+       - 持续监控任务执行
+       - 处理暂停/恢复/停止请求
+       - 处理完成/失败的任务
+       - Worker就绪时触发任务分配
+
+    5. 任务分配: _post_ready_tasks()
+       - 识别未分配的任务
+       - 调用_find_assignee()获取协调器分配结果
+       - 检查依赖是否满足
+       - 通过_post_task()将就绪任务发布到TaskChannel
+
+    6. 结果处理:
+       - 从TaskChannel接收完成的任务
+       - DONE任务: 通过_analyze_task()进行质量评估
+       - FAILED任务: 通过_handle_failed_task()进行失败分析和恢复
+       - 更新任务状态并触发下游任务
+
+    关键数据结构:
+    ------------
+    - _pending_tasks: Deque[Task] - 等待分配/执行的任务队列
+    - _task_dependencies: Dict[str, List[str]] - 依赖关系图
+    - _assignees: Dict[str, str] - task_id到worker_id的映射
+    - _completed_tasks: List[Task] - 用于依赖检查的已完成任务
+    - _in_flight_tasks: int - 当前正在执行的任务数
+
+    故障恢复:
+    --------
+    任务失败时,系统支持多种恢复策略:
+    - RETRY: 重新执行同一任务
+    - REPLAN: 修改任务描述后重试
+    - REASSIGN: 分配给其他Worker
+    - CREATE_WORKER: 为此任务创建专门的Worker
+    - DECOMPOSE: 将任务分解为更小的子任务
+
+    参见: RecoveryStrategy枚举, _handle_failed_task(), _analyze_task()
 
     Args:
         description (str): Description of the workforce.
@@ -341,21 +481,36 @@ class Workforce(BaseNode):
         ] = None,
     ) -> None:
         super().__init__(description)
+
+        # ======================================================================
+        # 阶段一: 基础配置与子节点初始化
+        # ======================================================================
+        # _child_listening_tasks: 存储子节点监听任务的句柄,用于优雅关闭
         self._child_listening_tasks: Deque[
             Union[asyncio.Task, concurrent.futures.Future]
         ] = deque()
+        # _children: 所有子节点列表(Worker或嵌套Workforce)
         self._children = children or []
+        # 可选的动态Worker模板Agent
         self.new_worker_agent = new_worker_agent
+        # 默认模型配置,用于创建默认Agent
         self.default_model = default_model
+        # 优雅关闭超时时间
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
+        # 是否在所有Agent间共享内存(上下文历史)
         self.share_memory = share_memory
+        # 是否使用结构化输出处理器(兼容性更好)
         self.use_structured_output_handler = use_structured_output_handler
+        # 任务执行超时时间
         self.task_timeout_seconds = (
             task_timeout_seconds or TASK_TIMEOUT_SECONDS
         )
+        # 执行模式: AUTO_DECOMPOSE(自动分解) 或 PIPELINE(预定义管道)
         self.mode = mode
-        self._initial_mode = mode  # Store initial mode for reset()
-        # Initialize failure handling configuration (supports dict input)
+        # 保存初始模式,用于reset()时恢复
+        self._initial_mode = mode
+
+        # 初始化失败处理配置(支持字典输入)
         if failure_handling_config is None:
             self.failure_handling_config = FailureHandlingConfig()
         elif isinstance(failure_handling_config, dict):
@@ -364,41 +519,79 @@ class Workforce(BaseNode):
             )
         else:
             self.failure_handling_config = failure_handling_config
+
+        # 初始化结构化输出处理器
         if self.use_structured_output_handler:
             self.structured_handler = StructuredOutputHandler()
+
+        # ======================================================================
+        # 阶段二: 任务状态追踪数据结构
+        # ======================================================================
+        # _task: 当前主任务
         self._task: Optional[Task] = None
+        # _pending_tasks: 待处理任务队列(双端队列,支持从头部插入子任务)
         self._pending_tasks: Deque[Task] = deque()
+        # _task_dependencies: 任务依赖关系图 {task_id: [dependency_task_ids]}
         self._task_dependencies: Dict[str, List[str]] = {}
+        # _assignees: 任务分配映射 {task_id: worker_id}
         self._assignees: Dict[str, str] = {}
+        # _in_flight_tasks: 当前正在执行的任务数量
         self._in_flight_tasks: int = 0
 
-        # Pipeline building state
+        # ======================================================================
+        # 阶段三: 管道模式与辅助追踪
+        # ======================================================================
+        # _pipeline_builder: PIPELINE模式下的任务构建器
         self._pipeline_builder: Optional[PipelineTaskBuilder] = None
-        # Dictionary to track task start times
+        # _task_start_times: 任务开始时间追踪 {task_id: timestamp}
+        # 用于超时检测和性能指标
         self._task_start_times: Dict[str, float] = {}
-        # Human intervention support
+
+        # ======================================================================
+        # 阶段四: 人工干预支持
+        # ======================================================================
+        # _state: 当前执行状态 (IDLE/RUNNING/PAUSED/STOPPED)
         self._state = WorkforceState.IDLE
+        # _pause_event: 暂停控制事件,用于暂停/恢复执行
         self._pause_event = asyncio.Event()
-        self._pause_event.set()  # Initially not paused
+        self._pause_event.set()  # 初始状态: 未暂停
+        # 停止/跳过请求标志
         self._stop_requested = False
         self._skip_requested = False
+        # _snapshots: 状态快照列表,用于恢复执行
         self._snapshots: List[WorkforceSnapshot] = []
+        # _completed_tasks: 已完成任务列表,用于依赖检查
         self._completed_tasks: List[Task] = []
+        # 异步事件循环和任务句柄
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._main_task_future: Optional[asyncio.Future] = None
         self._cleanup_task: Optional[asyncio.Task] = None
-        # Snapshot throttle support
+        # ======================================================================
+        # 阶段五: 流式回调与共享内存
+        # ======================================================================
+        # _last_snapshot_time: 上次自动快照时间戳
         self._last_snapshot_time: float = 0.0
-        # Minimum seconds between automatic snapshots
+        # snapshot_interval: 自动快照最小间隔(秒)
         self.snapshot_interval: float = 30.0
-        # Shared memory UUID tracking to prevent re-sharing duplicates
+        # _shared_memory_uuids: 已共享内存的Agent UUID集合,防止重复共享
         self._shared_memory_uuids: Set[str] = set()
-        # Optional user callback for worker streaming text chunks.
+        # _user_stream_callback: 用户提供的流式输出回调函数
+        # 签名: (worker_id, task_id, text_chunk, mode) -> None
         self._user_stream_callback = stream_callback
+        # _stream_progress: 流式进度追踪 {(worker_id, task_id): accumulated_text}
         self._stream_progress: Dict[Tuple[str, str], str] = {}
+
+        # 初始化回调处理器
         self._initialize_callbacks(callbacks)
 
-        # Set up coordinator agent with default system message
+        # ======================================================================
+        # 阶段六: 初始化三个核心Agent
+        # ======================================================================
+        # 核心Agent 1: Coordinator Agent (协调器)
+        # 职责: 分配任务给Worker、创建新Worker
+        # 使用提示词: ASSIGN_TASK_PROMPT, CREATE_NODE_PROMPT
+        # 关键方法: _find_assignee(), _call_coordinator_for_assignment()
+        # ======================================================================
         coord_agent_sys_msg = BaseMessage.make_assistant_message(
             role_name="Workforce Manager",
             content="You are coordinating a group of workers. A worker "
@@ -462,7 +655,12 @@ class Workforce(BaseNode):
                 stop_event=coordinator_agent.stop_event,
             )
 
-        # Set up task agent with default system message
+        # ======================================================================
+        # 核心Agent 2: Task Agent (任务规划器)
+        # 职责: 分解复杂任务、分析失败原因、评估结果质量
+        # 使用提示词: TASK_DECOMPOSE_PROMPT, TASK_ANALYSIS_PROMPT
+        # 关键方法: _decompose_task(), _analyze_task()
+        # ======================================================================
         task_sys_msg = BaseMessage.make_assistant_message(
             role_name="Task Planner",
             content=TASK_AGENT_SYSTEM_MESSAGE,
@@ -529,6 +727,13 @@ class Workforce(BaseNode):
                 stop_event=task_agent.stop_event,
             )
 
+        # ======================================================================
+        # 核心Agent 3: New Worker Agent (动态Worker模板)
+        # 职责: 当任务失败且现有Worker无法处理时,作为模板创建新的专门Worker
+        # 使用提示词: CREATE_NODE_PROMPT
+        # 关键方法: _create_worker_node_for_task()
+        # 注意: 这是一个模板Agent,运行时动态创建Worker实例
+        # ======================================================================
         if new_worker_agent is None:
             logger.info(
                 "No new_worker_agent provided. Workers created at runtime "
@@ -1478,21 +1683,27 @@ class Workforce(BaseNode):
             Callable[["ChatAgentResponse"], None]
         ] = None,
     ) -> Union[List[Task], Generator[List[Task], None, None]]:
-        r"""Decompose the task into subtasks. This method will also set the
-        relationship between the task and its subtasks.
+        r"""将任务分解为子任务,并设置任务与子任务之间的关系。
+
+        这是实际调用Task Agent进行任务分解的方法。
+
+        执行流程:
+            1. 检查执行模式(PIPELINE模式下跳过分解)
+            2. 构建任务分解提示词(TASK_DECOMPOSE_PROMPT)
+            3. 重置Task Agent状态(清空历史对话)
+            4. 调用task.decompose()执行分解
+            5. 处理流式或非流式结果
+            6. 更新子任务依赖关系
 
         Args:
-            task (Task): The task to decompose.
-            stream_callback (Callable[[ChatAgentResponse], None], optional): A
-                callback function that receives each chunk (ChatAgentResponse)
-                during streaming decomposition.
+            task (Task): 要分解的任务。
+            stream_callback: 流式回调函数,在流式分解时接收每个块。
 
         Returns:
-            Union[List[Task], Generator[List[Task], None, None]]:
-            The subtasks or generator of subtasks. Returns empty list for
-            PIPELINE mode.
+            子任务列表,或子任务生成器(流式模式)。
+            PIPELINE模式下返回空列表。
         """
-        # In PIPELINE mode, don't decompose - use predefined tasks
+        # PIPELINE模式下使用预定义任务,不进行动态分解
         if self.mode == WorkforceMode.PIPELINE:
             return []
 
@@ -2507,20 +2718,39 @@ class Workforce(BaseNode):
             "main_task_id": self._task.id if self._task else None,
         }
 
+    # ==========================================================================
+    # 核心方法1: 任务分解与入队
+    # ==========================================================================
+    # 这是任务进入Workforce的第一站,负责:
+    #   1. 验证任务内容(非空检查)
+    #   2. 重置Workforce状态(如果需要)
+    #   3. 调用Task Agent分解任务
+    #   4. 将子任务添加到待处理队列
+    #
+    # 流程: 验证 -> 重置 -> 记录事件 -> 分解 -> 更新依赖 -> 入队
+    # 调用: _decompose_task() -> task.decompose() -> _update_dependencies_for_decomposition()
+    # ==========================================================================
     async def handle_decompose_append_task(
         self, task: Task, reset: bool = True
     ) -> List[Task]:
-        r"""Handle task decomposition and validation with
-        workforce environment functions. Then append to
-        pending tasks if decomposition happened.
+        r"""处理任务分解和验证,然后将任务添加到待处理队列。
+
+        这是任务进入Workforce的核心入口方法。
+
+        执行流程:
+            1. 验证任务内容是否有效(非空检查)
+            2. 如需要则重置Workforce状态
+            3. 记录TaskCreatedEvent事件
+            4. 调用_decompose_task()分解任务为子任务
+            5. 如分解成功,记录TaskDecomposedEvent事件
+            6. 将子任务(或原任务)添加到_pending_tasks队列
 
         Args:
-            task (Task): The task to be processed.
-            reset (Bool): Should trigger workforce reset (Workforce must not
-                be running). Default: True
+            task (Task): 要处理的任务。
+            reset (Bool): 是否在处理前重置Workforce状态(Workforce必须未运行)。默认True。
 
         Returns:
-            List[Task]: The decomposed subtasks or the original task.
+            List[Task]: 分解后的子任务列表,如果没有分解则返回包含原任务的列表。
         """
         if not validate_task_content(task.content, task.id):
             task.state = TaskState.FAILED
@@ -3690,19 +3920,40 @@ class Workforce(BaseNode):
         valid_worker_ids = {child.node_id for child in self._children}
         return valid_worker_ids
 
+    # ==========================================================================
+    # 核心方法6: Coordinator Agent调用
+    # ==========================================================================
+    # 实际调用Coordinator Agent进行任务分配的LLM推理。
+    #
+    # 执行流程:
+    #   1. 格式化任务信息(任务ID、内容、附加信息)
+    #   2. 构建ASSIGN_TASK_PROMPT
+    #   3. 如有无效分配,添加反馈信息(用于重试)
+    #   4. 调用Coordinator Agent进行推理
+    #   5. 解析结构化输出(TaskAssignResult)
+    #
+    # 支持两种结构化输出模式:
+    #   - 结构化输出处理器(兼容性好)
+    #   - 原生结构化输出(效率高)
+    # ==========================================================================
     def _call_coordinator_for_assignment(
         self, tasks: List[Task], invalid_ids: Optional[List[str]] = None
     ) -> TaskAssignResult:
-        r"""Call coordinator agent to assign tasks with optional validation
-        feedback in the case of invalid worker IDs.
+        r"""调用Coordinator Agent分配任务,支持验证反馈重试。
+
+        这是_find_assignee()的核心调用,实际触发LLM推理。
+
+        提示词构建:
+            - 包含任务信息列表
+            - 包含可用Worker信息
+            - 重试时包含无效ID反馈
 
         Args:
-            tasks (List[Task]): Tasks to assign.
-            invalid_ids (List[str], optional): Invalid worker IDs from previous
-                attempt (if any).
+            tasks: 要分配的任务列表。
+            invalid_ids: 上次尝试的无效Worker ID(重试时使用)。
 
         Returns:
-            TaskAssignResult: Assignment result from coordinator.
+            Coordinator返回的任务分配结果(TaskAssignResult)。
         """
         # format tasks information for the prompt
         tasks_info = ""
@@ -3964,18 +4215,42 @@ class Workforce(BaseNode):
                     if dep_id in all_tasks
                 ]
 
+    # ==========================================================================
+    # 核心方法5: 任务分配决策
+    # ==========================================================================
+    # 调用Coordinator Agent为任务分配最适合的Worker。
+    #
+    # 执行流程:
+    #   1. 等待Worker就绪(指数退避重试)
+    #   2. 重置Coordinator Agent状态
+    #   3. 调用Coordinator Agent进行分配决策
+    #   4. 验证分配结果(Worker ID是否有效)
+    #   5. 如有无效分配,进行重试和回退处理
+    #
+    # 关键调用:
+    #   _call_coordinator_for_assignment() - 实际调用LLM进行分配
+    #   _validate_assignments() - 验证分配结果
+    # ==========================================================================
     async def _find_assignee(
         self,
         tasks: List[Task],
     ) -> TaskAssignResult:
-        r"""Assigns multiple tasks to worker nodes with the best capabilities.
+        r"""为多个任务分配最适合的Worker节点。
 
-        Parameters:
-            tasks (List[Task]): The tasks to be assigned.
+        这是Coordinator Agent的核心调用点,由_post_ready_tasks()触发。
+
+        执行流程:
+            1. 等待Worker就绪(指数退避,最多2秒)
+            2. 重置Coordinator Agent(清空历史)
+            3. 调用_call_coordinator_for_assignment()获取分配决策
+            4. 验证分配结果(_validate_assignments)
+            5. 处理无效分配(重试或回退到第一个Worker)
+
+        Args:
+            tasks: 要分配的任务列表。
 
         Returns:
-            TaskAssignResult: Assignment result containing task assignments
-                with their dependencies.
+            包含任务分配和依赖关系的TaskAssignResult。
         """
         # Wait for workers to be ready before assignment with exponential
         # backoff
@@ -4068,6 +4343,20 @@ class Workforce(BaseNode):
 
         return TaskAssignResult(assignments=all_assignments)
 
+    # ==========================================================================
+    # 核心方法7: 任务发布到通道
+    # ==========================================================================
+    # 将任务发布到TaskChannel,供Worker获取执行。
+    #
+    # 执行流程:
+    #   1. 记录任务开始时间(用于超时检测)
+    #   2. 更新任务分配映射
+    #   3. 记录TaskStartedEvent事件
+    #   4. 调用TaskChannel.post_task()发布任务
+    #   5. 增加_in_flight_tasks计数
+    #
+    # Worker会通过自己的监听循环从TaskChannel获取任务并执行。
+    # ==========================================================================
     async def _post_task(self, task: Task, assignee_id: str) -> None:
         # Record the start time when a task is posted
         self._task_start_times[task.id] = time.time()
@@ -4319,9 +4608,41 @@ class Workforce(BaseNode):
             logger.error(error_msg, exc_info=True)
             return None
 
+    # ==========================================================================
+    # 核心方法4: 任务调度与发布
+    # ==========================================================================
+    # 负责任务分配的核心方法,包含两个主要步骤:
+    #   步骤1: 识别新任务并调用Coordinator Agent进行分配
+    #   步骤2: 检查依赖满足情况,发布就绪任务到TaskChannel
+    #
+    # 依赖检查逻辑:
+    #   - PIPELINE模式: 依赖完成即可(无论成功失败)
+    #   - AUTO_DECOMPOSE模式: 依赖必须成功完成
+    #
+    # 关键调用:
+    #   _find_assignee() - 获取Coordinator的任务分配
+    #   _post_task() - 将任务发布到TaskChannel
+    # ==========================================================================
     async def _post_ready_tasks(self) -> None:
-        r"""Checks for unassigned tasks, assigns them, and then posts any
-        tasks whose dependencies have been met."""
+        r"""检查未分配的任务,进行分配,然后发布依赖已满足的任务。
+
+        这是任务调度的核心方法,由主事件循环定期调用。
+
+        步骤1 - 任务分配:
+            - PIPELINE模式: 任务已有依赖,只需分配Worker
+            - AUTO_DECOMPOSE模式: 新任务需要分配Worker和解析依赖
+            - 调用_find_assignee()获取Coordinator的分配决策
+
+        步骤2 - 任务发布:
+            - 遍历所有待处理任务
+            - 检查任务是否已分配且依赖已满足
+            - 调用_post_task()将任务发布到TaskChannel
+            - Worker会从TaskChannel获取并执行
+
+        依赖判断:
+            - PIPELINE: 允许错误传播,依赖完成(无论成败)即可执行
+            - AUTO_DECOMPOSE: 防止级联错误,依赖必须成功才能执行
+        """
 
         # Step 1: Identify and assign any new tasks in the pending queue
         # In PIPELINE mode, tasks already have dependencies set but need
@@ -5203,11 +5524,52 @@ class Workforce(BaseNode):
             logger.info("No pending tasks available, acting like stop.")
             return True  # Stop processing
 
+    # ==========================================================================
+    # 核心方法3: 主事件循环
+    # ==========================================================================
+    # Workforce的核心执行引擎,负责:
+    #   1. 启动所有子Worker
+    #   2. 监听任务通道,获取完成的任务
+    #   3. 处理暂停/恢复/停止请求
+    #   4. 任务完成/失败后的结果处理
+    #   5. 触发新任务的分配
+    #
+    # 执行流程:
+    #   启动 -> 初始发布任务 -> 循环(等待任务返回 -> 处理结果 -> 发布新任务)
+    #
+    # 关键调用:
+    #   _post_ready_tasks() - 检查并发布就绪任务
+    #   _get_returned_task() - 从TaskChannel获取完成的任务
+    #   _handle_completed_task() - 处理成功完成的任务
+    #   _handle_failed_task() - 处理失败的任务
+    # ==========================================================================
     @check_if_running(False)
     async def _listen_to_channel(self) -> None:
-        r"""Continuously listen to the channel, post task to the channel and
-        track the status of posted tasks. Now supports pause/resume and
-        graceful stop.
+        r"""持续监听任务通道,发布任务并追踪任务状态。
+
+        这是Workforce的主事件循环,协调整个执行流程。
+
+        循环条件:
+            - 有待处理任务 或
+            - 有正在执行的任务 或
+            - 有主任务需要处理
+            且未收到停止请求
+
+        每次迭代执行:
+            1. 检查暂停请求(_pause_event.wait())
+            2. 检查停止/跳过请求
+            3. 检查队首任务是否需要分解
+            4. 等待任务返回(_get_returned_task)
+            5. 根据任务状态处理:
+               - DONE: 质量评估 -> 完成处理
+               - FAILED: 失败分析 -> 恢复策略
+            6. 发布新就绪的任务(_post_ready_tasks)
+
+        支持:
+            - 暂停/恢复: 通过_pause_event控制
+            - 优雅停止: 完成当前任务后退出
+            - 任务分解: 动态分解主任务
+            - 故障恢复: 自动重试、重新规划等
         """
 
         self._running = True
@@ -5743,19 +6105,34 @@ class Workforce(BaseNode):
         else:
             asyncio.run_coroutine_threadsafe(coro, loop)
 
+    # ==========================================================================
+    # 核心方法8: 启动执行
+    # ==========================================================================
+    # 启动Workforce和所有子节点,进入执行阶段。
+    #
+    # 执行流程:
+    #   1. 如同启用共享内存,同步所有Agent的上下文
+    #   2. 启动所有子Worker(每个Worker在自己的任务中运行)
+    #   3. 进入主事件循环(_listen_to_channel)
+    #
+    # 注意: 此方法会阻塞直到所有任务完成或停止请求。
+    # ==========================================================================
     @check_if_running(False)
     async def start(self) -> None:
-        r"""Start itself and all the child nodes under it."""
-        # Sync shared memory at the start to ensure all agents have context
+        r"""启动Workforce和所有子节点。"""
+        # 如同启用共享内存,同步所有Agent的上下文历史
         if self.share_memory:
             logger.info(
                 f"Syncing shared memory at workforce {self.node_id} startup"
             )
             self._sync_shared_memory()
 
+        # 启动所有子Worker,每个Worker在自己的asyncio任务中运行
         for child in self._children:
             child_listening_task = asyncio.create_task(child.start())
             self._child_listening_tasks.append(child_listening_task)
+
+        # 进入主事件循环,阻塞直到完成
         await self._listen_to_channel()
 
     @check_if_running(True)
